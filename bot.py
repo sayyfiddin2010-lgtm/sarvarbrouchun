@@ -448,7 +448,7 @@ def handle_my_info(message: Message):
             f"📛 Ism: {user[0]}\n"
             f"📞 Tel: {user[1]}\n"
             f"⭐ Ball: {user[2]}\n"
-            f"👤 Username: {username_text}\n"
+            f"👤 Nom: {username_text}\n"
             f"📅 Qo'shilgan: {user[3]}\n"
             f"👥 Kim taklif qilgan: {referrer_text}\n"
         )
