@@ -1,5 +1,5 @@
 # bot.py
-# IELTS Maxing Bot - To'liq tuzatilgan versiya
+# IELTS Maxing Bot - To'liq versiya
 
 import os
 import sqlite3
@@ -63,6 +63,17 @@ def init_db():
         )
     ''')
     
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ball_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            change_amount INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            admin_id INTEGER DEFAULT NULL,
+            date TEXT NOT NULL
+        )
+    ''')
+    
     conn.commit()
     conn.close()
     print("✅ Database tayyor")
@@ -92,9 +103,8 @@ def register_user(user_id: int, full_name: str, phone: str, username: str, refer
     ''', (user_id, full_name, phone, referrer_id, now, username))
     conn.commit()
     
-    # Referal ball qo'shish (FAQAT referrer_id bo'lsa)
+    # Referal ball qo'shish
     if referrer_id and referrer_id != user_id:
-        # Referrer mavjudligini tekshirish
         c.execute("SELECT 1 FROM users WHERE user_id = ?", (referrer_id,))
         if c.fetchone():
             c.execute("UPDATE users SET refer_ball = refer_ball + 1 WHERE user_id = ?", (referrer_id,))
@@ -104,7 +114,13 @@ def register_user(user_id: int, full_name: str, phone: str, username: str, refer
             ''', (referrer_id, user_id, now))
             conn.commit()
             
-            # Referal qilgan odamga habar yuborish
+            # Ball log
+            c.execute('''
+                INSERT INTO ball_logs (user_id, change_amount, reason, date)
+                VALUES (?, ?, ?, ?)
+            ''', (referrer_id, 1, f"referal - {full_name}", now))
+            conn.commit()
+            
             try:
                 ball = get_user_ball(referrer_id)
                 bot.send_message(
@@ -113,32 +129,71 @@ def register_user(user_id: int, full_name: str, phone: str, username: str, refer
                     f"Sizning referal linkingiz orqali <b>{full_name}</b> ismli foydalanuvchi botga qo'shildi!\n"
                     f"⭐ Sizning ballaringiz <b>+1</b> ga oshdi. (Jami: {ball})"
                 )
-            except Exception as e:
-                print(f"Xabar yuborishda xatolik: {e}")
+            except:
+                pass
     
     conn.close()
 
-def deduct_ball_from_referrer(user_id: int):
-    """Foydalanuvchi botni tark etsa, refererdan ball ayirish"""
+def change_user_ball(user_id: int, change: int, admin_id: int = None, reason: str = ""):
+    """Foydalanuvchi ballini o'zgartirish"""
     conn = get_db_connection()
     c = conn.cursor()
+    
+    # Ballni o'zgartirish
+    c.execute("UPDATE users SET refer_ball = refer_ball + ? WHERE user_id = ? AND refer_ball + ? >= 0", (change, user_id, change))
+    conn.commit()
+    
+    # Log yozish
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('''
+        INSERT INTO ball_logs (user_id, change_amount, reason, admin_id, date)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, change, reason, admin_id, now))
+    conn.commit()
+    
+    # Yangi ballni olish
+    c.execute("SELECT refer_ball FROM users WHERE user_id = ?", (user_id,))
+    new_ball = c.fetchone()[0]
+    conn.close()
+    
+    return new_ball
+
+def deduct_ball_for_unsubscribe(user_id: int):
+    """Kanal chiqqanlik uchun ball ayirish (1 ta kanal chiqsa ham)"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Referrer ni topish
     c.execute("SELECT referrer_id FROM users WHERE user_id = ? AND is_active = 1", (user_id,))
     result = c.fetchone()
+    
     if result and result[0]:
         referrer_id = result[0]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Ball ayirish
         c.execute("UPDATE users SET refer_ball = refer_ball - 1 WHERE user_id = ? AND refer_ball > 0", (referrer_id,))
         conn.commit()
         
-        # Ball ayirilgani haqida habar
+        # Log yozish
+        c.execute('''
+            INSERT INTO ball_logs (user_id, change_amount, reason, date)
+            VALUES (?, ?, ?, ?)
+        ''', (referrer_id, -1, f"taklif qilingan foydalanuvchi kanaldan chiqdi (ID: {user_id})", now))
+        conn.commit()
+        
+        # Refererga xabar yuborish
         try:
+            new_ball = get_user_ball(referrer_id)
             bot.send_message(
                 referrer_id,
                 f"⚠️ <b>Diqqat!</b>\n\n"
-                f"Siz taklif qilgan foydalanuvchi botni tark etdi.\n"
-                f"Sizning ballaringizdan <b>-1</b> ayirildi."
+                f"Siz taklif qilgan foydalanuvchi kanallardan biriga obunani bekor qildi.\n"
+                f"Sizning ballaringizdan <b>-1</b> ayirildi. (Jami: {new_ball})"
             )
         except:
             pass
+    
     conn.close()
 
 def get_user_ball(user_id: int) -> int:
@@ -173,7 +228,7 @@ def get_all_users_for_admin() -> List[Tuple]:
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
-        SELECT user_id, full_name, phone, refer_ball, username, joined_date, is_active 
+        SELECT user_id, full_name, phone, refer_ball, username, joined_date, is_active, referrer_id 
         FROM users ORDER BY refer_ball DESC
     ''')
     result = c.fetchall()
@@ -212,7 +267,6 @@ def update_user_activity(user_id: int, is_active: int):
     conn.close()
 
 def get_referrer_info(user_id: int):
-    """Foydalanuvchini kim taklif qilganini olish"""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
@@ -225,10 +279,23 @@ def get_referred_users(user_id: int) -> List[Tuple]:
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
-        SELECT u.user_id, u.full_name, u.username, u.phone, u.joined_date 
+        SELECT u.user_id, u.full_name, u.username, u.phone, u.joined_date, u.is_active
         FROM users u
-        WHERE u.referrer_id = ? AND u.is_active = 1
+        WHERE u.referrer_id = ?
     ''', (user_id,))
+    result = c.fetchall()
+    conn.close()
+    return result
+
+def get_ball_logs(user_id: int, limit: int = 20) -> List[Tuple]:
+    """Ball o'zgarish tarixi"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        SELECT change_amount, reason, date FROM ball_logs 
+        WHERE user_id = ? 
+        ORDER BY date DESC LIMIT ?
+    ''', (user_id, limit))
     result = c.fetchall()
     conn.close()
     return result
@@ -242,8 +309,7 @@ def check_subscriptions(user_id: int) -> Tuple[bool, List[str]]:
             member = bot.get_chat_member(channel_username, user_id)
             if member.status in ["left", "kicked"]:
                 not_subscribed.append(name)
-        except Exception as e:
-            print(f"Kanal tekshirish xatosi {name}: {e}")
+        except Exception:
             not_subscribed.append(name)
     return len(not_subscribed) == 0, not_subscribed
 
@@ -275,8 +341,18 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("👥 Barcha foydalanuvchilar", callback_data="admin_users"),
         InlineKeyboardButton("🔗 Kim kimni taklif qilgan", callback_data="admin_referrals"),
         InlineKeyboardButton("📊 Statistika", callback_data="admin_stats"),
+        InlineKeyboardButton("⚡ ZET ballini o'zgartirish", callback_data="admin_zet_ball"),
         InlineKeyboardButton("❌ Yopish", callback_data="admin_close")
     )
+    return keyboard
+
+def get_zet_ball_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("➕ +1 ball", callback_data=f"zet_add_{user_id}"),
+        InlineKeyboardButton("➖ -1 ball", callback_data=f"zet_remove_{user_id}")
+    )
+    keyboard.add(InlineKeyboardButton("◀️ Orqaga", callback_data="admin_back"))
     return keyboard
 
 # ==================== OBUNA FILTRI ====================
@@ -285,21 +361,31 @@ def subscription_required(func):
     def wrapper(message):
         user_id = message.from_user.id
         
-        # Ro'yxatdan o'tmagan bo'lsa, start ga yuborish
         if not user_exists(user_id):
             bot.send_message(user_id, "❌ Iltimos, avval /start buyrug'ini bosing!")
             return
         
-        # Obunani tekshirish
         is_subscribed, not_subscribed = check_subscriptions(user_id)
         
         if not is_subscribed:
-            text = "❌ <b>IELTS Maxing</b> botidan foydalanish uchun quyidagi kanallarga obuna bo'ling:\n\n"
+            # Foydalanuvchi kanaldan chiqqan - ball ayirish
+            deduct_ball_for_unsubscribe(user_id)
+            update_user_activity(user_id, 0)
+            
+            text = "⚠️ <b>Diqqat! Siz kanallardan biriga obunani bekor qildingiz!</b>\n\n"
+            text += "❌ Botdan foydalanish uchun quyidagi kanallarga qayta obuna bo'ling:\n\n"
             for name in not_subscribed:
                 text += f"🔹 {name}\n"
             text += "\n✅ Obuna bo'lgach <b>Obunani tekshirish</b> tugmasini bosing!"
             bot.send_message(user_id, text, reply_markup=get_subscription_keyboard())
             return
+        
+        # Agar foydalanuvchi faol emas bo'lsa, faollashtirish
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
         
         return func(message)
     return wrapper
@@ -311,7 +397,6 @@ def cmd_start(message: Message):
     username = message.from_user.username
     text = message.text
     
-    # Referal ID ni olish
     referrer_id = None
     parts = text.split()
     if len(parts) > 1:
@@ -324,7 +409,6 @@ def cmd_start(message: Message):
     
     print(f"📝 Yangi foydalanuvchi: {user_id}, Referrer: {referrer_id}")
     
-    # Obunani tekshirish
     is_subscribed, not_subscribed = check_subscriptions(user_id)
     
     if not is_subscribed:
@@ -335,7 +419,6 @@ def cmd_start(message: Message):
         bot.send_message(user_id, text_msg, reply_markup=get_subscription_keyboard())
         return
     
-    # Agar foydalanuvchi ro'yxatdan o'tmagan bo'lsa
     if not user_exists(user_id):
         msg = bot.send_message(
             user_id,
@@ -380,8 +463,6 @@ def process_phone(message: Message, full_name: str, referrer_id: int, username: 
         return
     
     phone = message.contact.phone_number
-    
-    # Foydalanuvchini ro'yxatga olish
     register_user(user_id, full_name, phone, username, referrer_id)
     
     if referrer_id and referrer_id != user_id:
@@ -409,8 +490,8 @@ def handle_referal(message: Message):
     bot_username = bot.get_me().username
     referal_link = f"https://t.me/{bot_username}?start={user_id}"
     
-    # Taklif qilganlar soni
-    referred_count = len(get_referred_users(user_id))
+    referred_users = get_referred_users(user_id)
+    referred_count = len([u for u in referred_users if u[5] == 1])
     
     text = (
         "🌟 <b>Referal tizimi</b> 🌟\n\n"
@@ -450,22 +531,23 @@ def handle_my_info(message: Message):
     
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT full_name, phone, refer_ball, joined_date, username, referrer_id FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT full_name, phone, refer_ball, joined_date, username, referrer_id, is_active FROM users WHERE user_id = ?", (user_id,))
     user = c.fetchone()
     conn.close()
     
     if user:
         username_text = f"@{user[4]}" if user[4] else "Yo'q"
+        status = "✅ Faol" if user[6] else "❌ Faol emas"
         
-        # Kim taklif qilganini topish
         referrer_text = "Yo'q"
         if user[5]:
-            c2 = conn = get_db_connection()
+            conn2 = get_db_connection()
+            c2 = conn2.cursor()
             c2.execute("SELECT full_name FROM users WHERE user_id = ?", (user[5],))
             referrer = c2.fetchone()
             if referrer:
                 referrer_text = referrer[0]
-            conn.close()
+            conn2.close()
         
         text = (
             "👤 <b>Mening ma'lumotlarim</b>\n\n"
@@ -475,6 +557,7 @@ def handle_my_info(message: Message):
             f"👤 <b>Username:</b> {username_text}\n"
             f"📅 <b>Qo'shilgan sana:</b> {user[3]}\n"
             f"👥 <b>Kim taklif qilgan:</b> {referrer_text}\n"
+            f"📊 <b>Holat:</b> {status}\n"
         )
         bot.send_message(user_id, text)
 
@@ -508,12 +591,25 @@ def handle_admin_callbacks(call: CallbackQuery):
         for user in users[:30]:
             username_text = f"@{user[4]}" if user[4] else "Yo'q"
             status = "✅ Faol" if user[6] else "❌ Faol emas"
+            
+            # Kim taklif qilganini ko'rsatish
+            referrer_text = "Yo'q"
+            if user[7]:
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute("SELECT full_name FROM users WHERE user_id = ?", (user[7],))
+                ref = c.fetchone()
+                if ref:
+                    referrer_text = ref[0]
+                conn.close()
+            
             text += (
                 f"🆔 ID: <code>{user[0]}</code>\n"
                 f"📛 Ism: {user[1]}\n"
                 f"📞 Tel: {user[2]}\n"
                 f"👤 Username: {username_text}\n"
                 f"⭐ Ball: {user[3]}\n"
+                f"👥 Kim taklif qilgan: {referrer_text}\n"
                 f"📅 Qo'shilgan: {user[5]}\n"
                 f"{status}\n"
                 f"{'─' * 30}\n"
@@ -555,10 +651,46 @@ def handle_admin_callbacks(call: CallbackQuery):
         )
         bot.edit_message_text(text, user_id, call.message.message_id)
     
+    elif call.data == "admin_zet_ball":
+        text = f"⚡ <b>ZET ballini o'zgartirish</b>\n\n"
+        text += f"ZET ID: <code>{ZET_ID}</code>\n"
+        text += f"Joriy ball: <b>{get_user_ball(ZET_ID)}</b>\n\n"
+        text += "Quyidagi tugmalar orqali ballni o'zgartiring:"
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=get_zet_ball_keyboard(ZET_ID))
+    
+    elif call.data == "admin_back":
+        bot.edit_message_text(
+            "⚙️ <b>Admin panel</b>\n\nQuyidagi bo'limlardan birini tanlang:",
+            user_id, call.message.message_id, reply_markup=get_admin_keyboard()
+        )
+    
     elif call.data == "admin_close":
         bot.delete_message(user_id, call.message.message_id)
     
     bot.answer_callback_query(call.id)
+
+# ZET ballini o'zgartirish
+@bot.callback_query_handler(func=lambda call: call.data.startswith("zet_add_") or call.data.startswith("zet_remove_"))
+def handle_zet_ball(call: CallbackQuery):
+    admin_id = call.from_user.id
+    
+    if admin_id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "❌ Siz admin emassiz!", show_alert=True)
+        return
+    
+    target_id = int(call.data.split("_")[2])
+    is_add = call.data.startswith("zet_add_")
+    
+    change = 1 if is_add else -1
+    new_ball = change_user_ball(target_id, change, admin_id, f"admin tomonidan o'zgartirildi")
+    
+    text = f"✅ <b>Ball o'zgartirildi!</b>\n\n"
+    text += f"👤 Foydalanuvchi ID: <code>{target_id}</code>\n"
+    text += f"{'➕ +1' if is_add else '➖ -1'} ball\n"
+    text += f"⭐ Yangi ball: <b>{new_ball}</b>"
+    
+    bot.edit_message_text(text, call.from_user.id, call.message.message_id)
+    bot.answer_callback_query(call.id, f"Ball {'qo\'shildi' if is_add else 'ayirildi'}!")
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_subscription")
 def check_subscription_callback(call: CallbackQuery):
@@ -567,8 +699,15 @@ def check_subscription_callback(call: CallbackQuery):
     
     if is_subscribed:
         bot.delete_message(user_id, call.message.message_id)
+        
+        # Foydalanuvchini qayta faollashtirish
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        
         if not user_exists(user_id):
-            # Obuna bo'ldi, endi ro'yxatdan o'tish
             msg = bot.send_message(
                 user_id,
                 "✅ Obuna tasdiqlandi!\n\n🌟 <b>IELTS Maxing</b> botiga xush kelibsiz!\n\n📝 <b>Iltimos, o'z ismingizni kiriting:</b>",
@@ -598,19 +737,19 @@ def handle_my_chat_member(message):
         user_id = message.from_user.id
         if user_exists(user_id):
             update_user_activity(user_id, 0)
-            deduct_ball_from_referrer(user_id)
-            print(f"⚠️ User {user_id} botni tark etdi. Ball ayirildi.")
+            print(f"⚠️ User {user_id} botni tark etdi.")
 
 # ==================== ISHGA TUSHIRISH ====================
 if __name__ == "__main__":
-    print("=" * 40)
+    print("=" * 50)
     print("✅ IELTS Maxing bot ishga tushdi!")
-    print("=" * 40)
+    print("=" * 50)
     print("📢 Kanallar:")
     for name, link in CHANNELS.items():
         print(f"   - {name}: {link}")
     print(f"👑 Adminlar: {ADMIN_IDS}")
-    print("=" * 40)
+    print(f"⭐ ZET ID: {ZET_ID}")
+    print("=" * 50)
     print("🚀 Bot polling rejimida ishlayapti...")
-    print("=" * 40)
+    print("=" * 50)
     bot.infinity_polling(skip_pending=True)
